@@ -1,0 +1,101 @@
+# Runs on every push: checks your portfolio, then publishes it with GitHub Pages.
+# If a check fails, the site is NOT published and GitHub emails you.
+name: Check and publish portfolio
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the site folder (the one holding index.html)
+        run: |
+          f=$(find . -name index.html -not -path './.git/*' -not -path './node_modules/*' | head -1)
+          [ -n "$f" ] || { echo "No index.html found"; exit 1; }
+          echo "SITE=$(dirname "$f")" >> "$GITHUB_ENV"
+          echo "Site folder: $(dirname "$f")"
+
+      - name: Checks
+        run: |
+          python3 - <<'PY'
+          import csv, os, re, sys, pathlib
+          site = pathlib.Path(os.environ["SITE"])
+          bad = []
+          html = (site / "index.html").read_text(encoding="utf-8")
+
+          # 1. required files
+          for f in ["style.css", "script.js", "pamphlets.js", "data/survey.csv"]:
+              if not (site / f).exists():
+                  bad.append(f"missing file: {f}")
+
+          # 2. security policy present, strict, and no outside sites
+          m = re.search(r'http-equiv="Content-Security-Policy" content="([^"]*)"', html)
+          if not m: bad.append("no Content-Security-Policy tag in index.html")
+          else:
+              csp = m.group(1)
+              if "unsafe-inline" in csp or "unsafe-eval" in csp: bad.append("CSP allows unsafe-inline/eval")
+              if re.search(r"https?://", csp): bad.append("CSP allows an outside site (add on purpose only)")
+
+          # 3. page must not load anything from outside sites
+          for name in ["index.html", "style.css", "script.js", "pamphlets.js"]:
+              t = (site / name).read_text(encoding="utf-8", errors="ignore")
+              for u in re.findall(r'(?:src|href)="(https?://[^"]+)"|url\((https?://[^)]+)\)|@import[^;]*https?://', t):
+                  pass
+              for tag in re.findall(r'<(?:script|link|img|iframe)[^>]+(?:src|href)="https?://[^"]+"', t):
+                  if "<a " not in tag: bad.append(f"{name}: loads from outside: {tag[:80]}")
+              if "@import" in t and "http" in t.split("@import")[1][:80]: bad.append(f"{name}: @import from outside")
+
+          # 4. no secrets
+          pats = [r"AKIA[0-9A-Z]{16}", r"gh[pousr]_[A-Za-z0-9]{30,}", r"sk-[A-Za-z0-9]{20,}",
+                  r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+                  r"(?i)(api[_-]?key|secret|passwd|password|token)\s*[:=]\s*['\"][^'\"]{8,}['\"]"]
+          for p in site.rglob("*"):
+              if p.is_file() and p.suffix in {".html", ".js", ".css", ".csv", ".json", ".sql", ".md", ".txt", ""}:
+                  t = p.read_text(encoding="utf-8", errors="ignore")
+                  for pat in pats:
+                      if re.search(pat, t): bad.append(f"possible secret in {p}")
+
+          # 5. headline number still true: 264 of 360 satisfied
+          rows = list(csv.reader(open(site / "data/survey.csv", newline="", encoding="utf-8")))[1:]
+          sat = sum(int(r[4]) >= 4 for r in rows)
+          print(f"{sat} of {len(rows)} satisfied = {100*sat/len(rows):.1f}%")
+          if f"{100*sat/len(rows):.1f}%" not in html: bad.append("page does not show the % that the CSV gives")
+
+          if bad:
+              print("\nPROBLEMS:"); [print(" -", b) for b in bad]; sys.exit(1)
+          print("All checks passed.")
+          PY
+
+      - name: JavaScript syntax
+        run: |
+          node --check "$SITE/script.js"
+          node --check "$SITE/pamphlets.js"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.SITE }}
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
